@@ -1,1 +1,4 @@
-run_id,date,author,model,seed,accuracy,precision,recall,f1,macro_f1,kappa,train_time_s,notes
+run_id,date,author,model,hyperparameters,seed,train_time_s,parameters,train_accuracy,train_kappa,val_accuracy,val_normal_recall,val_precision,val_recall,val_f1,val_macro_f1,val_kappa,val_auc,notes
+baseline_majority,2026-11-27 18:36,team,MajorityBaseline,"{""strategy"": ""most_frequent""}",42,0.0,0,0.5957,0.0,0.5943,1.0,0.0,0.0,0.0,0.3728,0.0,0.5,Trivial majority-class floor (Checkpoint 2)
+baseline_logreg_unweighted,2026-11-27 18:36,team,LogisticBaseline_unweighted,"{""input"": ""64x64_gray"", ""scaler"": ""StandardScaler"", ""C"": 0.01, ""class_weight"": null}",42,9.32,4097,0.6704,0.2594,0.5759,0.8037,0.4571,0.2421,0.3166,0.5045,0.0495,0.5415,Learned linear baseline without imbalance handling (Checkpoint 2)
+baseline_logreg_balanced,2026-11-27 18:36,team,LogisticBaseline_balanced,"{""input"": ""64x64_gray"", ""scaler"": ""StandardScaler"", ""C"": 0.01, ""class_weight"": ""balanced""}",42,8.88,4097,0.6569,0.3043,0.5348,0.5558,0.4365,0.5041,0.4678,0.5273,0.0584,0.5412,Learned linear baseline with balanced class weights (Checkpoint 2)

@@ -1,101 +1,134 @@
 """
 data.py — Data loading, cleaning, splitting, and preprocessing for the MURA dataset.
 
-This module provides a leak-free pipeline that:
-  1. Parses the MURA CSV manifests to build an image-level dataframe.
-  2. Splits data at the **patient** level (not image level) to prevent leakage.
-  3. Applies pixel rescaling (1/255) fitted conceptually on train only.
-  4. Optionally applies augmentation to the training split only.
-  5. Returns tf.keras ImageDataGenerator flows for train / val / test.
-
-Design decisions (linked to EDA findings):
-  - Patient-level grouping: a single patient may have multiple studies and
-    images; mixing them across splits would leak identity information.
-  - Stratification by label ensures each split preserves the ~38 % positive
-    rate found in the EDA.
-  - Class weights are computed from the training split to address the mild
-    class imbalance (61 % normal vs 39 % abnormal).
+This module implements a strictly leak-free data engineering pipeline:
+  1. Parses the MURA v1.1 CSV manifests to construct an image-level dataframe
+     with body part, patient ID, globally unique study ID, and binary label.
+  2. Cleans the manifest by removing path duplicates, verifying file presence,
+     and deduplicating byte-identical radiograph files (via file-size + MD5 hash)
+     so identical scans cannot leak across patient splits.
+  3. Splits official training data into Train / Validation / Test (70 / 15 / 15)
+     at the **patient** level, stratified by both primary body part and label.
+     The official MURA ``valid`` set is kept separate and untouched as an
+     external multi-radiologist benchmark.
+  4. Computes class weights strictly from the training split to mitigate class
+     imbalance (59.6% normal vs 40.4% abnormal at image level).
+  5. Provides fast grayscale array loading for sklearn baselines and modern
+     ``tf.data`` + Keras preprocessing layers (TF 2.15 through Keras 3) with
+     data augmentation restricted strictly to the training split.
 
 Authors: Team — Data Engineer work package.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import os
-import re
 import pathlib
-from typing import Dict, Tuple
+import random
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.model_selection import GroupShuffleSplit
+from PIL import Image
+from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
-import tensorflow as tf
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
+# ───────────────────── configuration & seeds ────────────────
 
-# ───────────────────── helpers ──────────────────────────────
 
 def load_config(path: str = "configs/base.yaml") -> dict:
-    """Load a YAML config file and return it as a dict."""
-    with open(path, "r") as f:
+    """Load a YAML configuration file and return it as a dictionary."""
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
+def resolve_data_root(cfg: dict, cli_root: Optional[str] = None) -> str:
+    """Resolve the MURA dataset root without hard-coding user paths.
+
+    Resolution priority:
+      1. Explicit CLI argument (``cli_root``)
+      2. Environment variable ``MURA_DATA_DIR``
+      3. ``cfg["data"]["root_dir"]`` from the YAML config
+    """
+    if cli_root:
+        return cli_root
+    env_root = os.environ.get("MURA_DATA_DIR")
+    if env_root:
+        return env_root
+    return cfg["data"]["root_dir"]
+
+
 def set_global_seed(seed: int = 42) -> None:
-    """Set random seeds for reproducibility across numpy, tf, and python."""
+    """Set random seeds across Python, NumPy, and TensorFlow (if installed)."""
+    random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+    if importlib.util.find_spec("tensorflow") is not None:
+        import tensorflow as tf
+
+        tf.random.set_seed(seed)
 
 
 # ───────────────────── CSV parsing ──────────────────────────
+
 
 def _extract_meta(path: str) -> dict:
     """Extract body-part, patient id, study id, and label from a MURA path.
 
     Example path:
-        MURA-v1.1/train/XR_SHOULDER/patient00001/study1_positive/image1.png
+        ``MURA-v1.1/train/XR_SHOULDER/patient00001/study1_positive/image1.png``
 
-    Returns:
-        dict with keys: body_part, patient_id, study_id, label, image_path
+    Note: ``study_id`` includes ``body_part`` because ~1,467 MURA patients
+    appear under multiple body parts with overlapping ``study1_*`` folders.
     """
-    parts = pathlib.PurePosixPath(path).parts
-    # parts = ('MURA-v1.1', 'train', 'XR_SHOULDER', 'patient00001',
-    #          'study1_positive', 'image1.png')
-    body_part = parts[2]                     # e.g. XR_SHOULDER
-    patient_id = parts[3]                    # e.g. patient00001
-    study_dir = parts[4]                     # e.g. study1_positive
-    study_id = f"{patient_id}/{study_dir}"
+    normalized = path.replace("\\", "/")
+    parts = pathlib.PurePosixPath(normalized).parts
+    if len(parts) < 6:
+        raise ValueError(f"Unexpected MURA path format: {path!r}")
 
-    # label is encoded in the study directory name
+    body_part = parts[2]
+    patient_id = parts[3]
+    study_dir = parts[4]
+    study_id = f"{body_part}/{patient_id}/{study_dir}"
+    study_path = "/".join(parts[:5]) + "/"
     label = 1 if "positive" in study_dir else 0
 
     return {
-        "image_path": path,
+        "image_path": normalized,
         "body_part": body_part,
         "patient_id": patient_id,
         "study_id": study_id,
+        "study_path": study_path,
         "label": label,
     }
 
 
-def build_dataframe(root_dir: str, image_paths_csv: str) -> pd.DataFrame:
-    """Build a DataFrame with one row per image from the MURA image-paths CSV.
+def build_dataframe(
+    root_dir: str,
+    image_paths_csv: str,
+    labeled_studies_csv: Optional[str] = None,
+) -> pd.DataFrame:
+    """Build an image-level DataFrame from a MURA image-paths CSV manifest.
 
     Parameters
     ----------
     root_dir : str
-        Filesystem path to the extracted MURA-v1.1 directory.
+        Filesystem path to the extracted ``MURA-v1.1`` directory.
     image_paths_csv : str
-        Name of the CSV file listing image paths (e.g. "train_image_paths.csv").
+        Filename of the image-paths CSV (e.g. ``"train_image_paths.csv"``).
+    labeled_studies_csv : str, optional
+        Optional study-level labels CSV to cross-verify directory labels.
 
     Returns
     -------
     pd.DataFrame
-        Columns: image_path, body_part, patient_id, study_id, label, abs_path
+        Columns: ``image_path``, ``body_part``, ``patient_id``, ``study_id``,
+        ``study_path``, ``label``, ``abs_path``.
     """
     csv_path = os.path.join(root_dir, image_paths_csv)
     raw = pd.read_csv(csv_path, header=None, names=["image_path"])
@@ -103,49 +136,91 @@ def build_dataframe(root_dir: str, image_paths_csv: str) -> pd.DataFrame:
     records = raw["image_path"].apply(_extract_meta).tolist()
     df = pd.DataFrame(records)
 
-    # Build absolute filesystem path
-    # The CSV paths look like "MURA-v1.1/train/…", so we resolve relative to
-    # the *parent* of root_dir (i.e. the directory that contains MURA-v1.1).
-    base = os.path.dirname(root_dir)
-    df["abs_path"] = df["image_path"].apply(lambda p: os.path.join(base, p))
+    base = os.path.dirname(os.path.abspath(root_dir))
+    df["abs_path"] = df["image_path"].apply(lambda p: os.path.join(base, *p.split("/")))
+
+    if labeled_studies_csv is not None:
+        labels_path = os.path.join(root_dir, labeled_studies_csv)
+        if os.path.isfile(labels_path):
+            studies = pd.read_csv(
+                labels_path, header=None, names=["study_path", "csv_label"]
+            )
+            df = df.merge(studies, on="study_path", how="left")
+            if df["csv_label"].notna().all():
+                df["label"] = df["csv_label"].astype(int)
+            df = df.drop(columns=["csv_label"])
 
     return df
 
 
 # ───────────────────── cleaning ─────────────────────────────
 
-def clean_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    """Clean the image dataframe.
+
+def _md5_file(path: str) -> str:
+    """Compute MD5 hex digest for a file on disk."""
+    hasher = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def clean_dataframe(
+    df: pd.DataFrame,
+    check_files: bool = True,
+    deduplicate_content: bool = True,
+) -> Tuple[pd.DataFrame, dict]:
+    """Clean the image dataframe and return cleaning diagnostics.
 
     Steps:
-      1. Drop exact duplicate rows (same image_path repeated).
-      2. Remove rows whose image file does not exist on disk.
-      3. Report missing-value counts (should be zero for MURA).
-
-    Returns
-    -------
-    df_clean : pd.DataFrame
-    report   : dict   cleaning statistics
+      1. Drop exact duplicate ``image_path`` rows.
+      2. Optionally verify all referenced files exist on disk and drop missing entries.
+      3. Optionally detect byte-identical image files (fast file-size prefilter
+         followed by MD5 comparison on collisions) so duplicate radiographs
+         across patients cannot leak across splits.
+      4. Record missing-value counts per column.
     """
-    report: dict = {}
+    report: dict = {"initial_rows": len(df)}
 
-    # Duplicates
+    # 1. Exact path duplicates
     n_before = len(df)
     df = df.drop_duplicates(subset=["image_path"]).reset_index(drop=True)
     report["duplicates_removed"] = n_before - len(df)
 
-    # Missing values
-    report["missing_values"] = df.isnull().sum().to_dict()
+    # 2. Missing values audit
+    report["missing_values"] = {k: int(v) for k, v in df.isnull().sum().items()}
 
-    # Existence check (sample first 500 for speed; full check optional)
-    sample = df.sample(min(500, len(df)), random_state=42)
-    missing_files = sample[~sample["abs_path"].apply(os.path.isfile)]
-    report["sample_missing_files"] = len(missing_files)
+    # 3. Full file-existence check
+    missing_files = 0
+    if check_files and "abs_path" in df.columns and len(df) > 0:
+        exists_mask = df["abs_path"].apply(os.path.isfile)
+        missing_files = int((~exists_mask).sum())
+        if missing_files > 0:
+            df = df[exists_mask].reset_index(drop=True)
+    report["missing_files_removed"] = missing_files
+
+    # 4. Exact byte-content deduplication via st_size prefilter + MD5
+    content_dups = 0
+    if deduplicate_content and check_files and "abs_path" in df.columns and len(df) > 1:
+        sizes = df["abs_path"].apply(os.path.getsize)
+        size_collisions = sizes.duplicated(keep=False)
+        if size_collisions.any():
+            candidate_idx = df.index[size_collisions].tolist()
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                hashes = list(ex.map(_md5_file, df.loc[candidate_idx, "abs_path"]))
+            hash_series = pd.Series(hashes, index=candidate_idx)
+            dup_hash_idx = hash_series[hash_series.duplicated(keep="first")].index
+            content_dups = len(dup_hash_idx)
+            if content_dups > 0:
+                df = df.drop(index=dup_hash_idx).reset_index(drop=True)
+    report["content_duplicates_removed"] = content_dups
+    report["final_rows"] = len(df)
 
     return df, report
 
 
 # ───────────────────── splitting ────────────────────────────
+
 
 def patient_stratified_split(
     df: pd.DataFrame,
@@ -153,84 +228,184 @@ def patient_stratified_split(
     test_frac: float = 0.15,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split data into train / val / test at the patient level.
+    """Split data into Train / Validation / Test strictly at the patient level.
 
-    All images from the same patient stay in the same split (no leakage).
-    Splits are stratified by label at the patient level.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain columns: patient_id, label
-    val_frac, test_frac : float
-        Fraction of *patients* for validation and test.
-    seed : int
-
-    Returns
-    -------
-    train_df, val_df, test_df : pd.DataFrame
+    Every patient appears in exactly one split (zero patient leakage). Splits are
+    stratified at the patient level by ``(primary_body_part, modal_label)`` when
+    all strata contain at least 2 patients, falling back cleanly to ``modal_label``
+    on tiny subsets.
     """
-    # Deduplicate to patient-level for splitting
-    patient_df = (
-        df.groupby("patient_id")["label"]
-        .agg(lambda s: int(s.mode().iloc[0]))
-        .reset_index()
-        .rename(columns={"label": "patient_label"})
-    )
+    if not (0.0 < val_frac < 1.0 and 0.0 < test_frac < 1.0 and val_frac + test_frac < 1.0):
+        raise ValueError(f"Invalid split fractions: val={val_frac}, test={test_frac}")
 
-    # First split: separate test patients
-    gss_test = GroupShuffleSplit(
-        n_splits=1,
+    agg_spec = {"patient_label": ("label", lambda s: int(s.mode().iloc[0]))}
+    if "body_part" in df.columns:
+        agg_spec["primary_body_part"] = ("body_part", lambda s: str(s.mode().iloc[0]))
+
+    patient_df = df.groupby("patient_id", sort=True).agg(**agg_spec).reset_index()
+
+    if "primary_body_part" in patient_df.columns:
+        joint_strat = patient_df["primary_body_part"] + "_" + patient_df["patient_label"].astype(str)
+        if joint_strat.value_counts().min() >= 3:
+            strat_col = joint_strat
+        elif patient_df["patient_label"].value_counts().min() >= 3:
+            strat_col = patient_df["patient_label"]
+        else:
+            strat_col = None
+    elif patient_df["patient_label"].value_counts().min() >= 3:
+        strat_col = patient_df["patient_label"]
+    else:
+        strat_col = None
+
+    patients_rest, patients_test = train_test_split(
+        patient_df,
         test_size=test_frac,
         random_state=seed,
+        stratify=strat_col,
     )
-    idx_rest, idx_test = next(
-        gss_test.split(patient_df, patient_df["patient_label"], groups=patient_df["patient_id"])
-    )
-    patients_test = set(patient_df.iloc[idx_test]["patient_id"])
-    patients_rest = patient_df.iloc[idx_rest]
 
-    # Second split: separate val from remaining
     relative_val = val_frac / (1.0 - test_frac)
-    gss_val = GroupShuffleSplit(
-        n_splits=1,
+    if strat_col is not None:
+        rest_strat = strat_col.loc[patients_rest.index]
+        if rest_strat.value_counts().min() < 2:
+            rest_strat = patients_rest["patient_label"]
+            if rest_strat.value_counts().min() < 2:
+                rest_strat = None
+    else:
+        rest_strat = None
+
+    patients_train, patients_val = train_test_split(
+        patients_rest,
         test_size=relative_val,
         random_state=seed,
+        stratify=rest_strat,
     )
-    idx_train, idx_val = next(
-        gss_val.split(patients_rest, patients_rest["patient_label"], groups=patients_rest["patient_id"])
-    )
-    patients_val = set(patients_rest.iloc[idx_val]["patient_id"])
-    patients_train = set(patients_rest.iloc[idx_train]["patient_id"])
 
-    train_df = df[df["patient_id"].isin(patients_train)].reset_index(drop=True)
-    val_df = df[df["patient_id"].isin(patients_val)].reset_index(drop=True)
-    test_df = df[df["patient_id"].isin(patients_test)].reset_index(drop=True)
+    train_ids = set(patients_train["patient_id"])
+    val_ids = set(patients_val["patient_id"])
+    test_ids = set(patients_test["patient_id"])
+
+    assert train_ids.isdisjoint(val_ids), "Patient leakage detected: train ∩ val"
+    assert train_ids.isdisjoint(test_ids), "Patient leakage detected: train ∩ test"
+    assert val_ids.isdisjoint(test_ids), "Patient leakage detected: val ∩ test"
+
+    train_df = df[df["patient_id"].isin(train_ids)].reset_index(drop=True)
+    val_df = df[df["patient_id"].isin(val_ids)].reset_index(drop=True)
+    test_df = df[df["patient_id"].isin(test_ids)].reset_index(drop=True)
 
     return train_df, val_df, test_df
 
 
-# ───────────────────── generators ───────────────────────────
+# ───────────────────── class weights ────────────────────────
 
-def _get_train_datagen(cfg: dict) -> ImageDataGenerator:
-    """Return an ImageDataGenerator with augmentation for training."""
-    aug = cfg.get("augmentation", {})
-    if aug.get("enabled", False):
-        return ImageDataGenerator(
-            rescale=cfg["image"]["rescale"],
-            rotation_range=aug.get("rotation_range", 20),
-            horizontal_flip=aug.get("horizontal_flip", True),
-            width_shift_range=aug.get("width_shift_range", 0.1),
-            height_shift_range=aug.get("height_shift_range", 0.1),
-            zoom_range=aug.get("zoom_range", 0.1),
-            fill_mode=aug.get("fill_mode", "nearest"),
+
+def compute_weights(train_df: pd.DataFrame) -> Dict[int, float]:
+    """Compute balanced class weights strictly from the training split."""
+    labels = train_df["label"].values
+    classes = np.unique(labels)
+    weights = compute_class_weight("balanced", classes=classes, y=labels)
+    return {int(cls): float(w) for cls, w in zip(classes, weights)}
+
+
+# ───────────────────── baseline array loader ────────────────
+
+
+def load_flattened_images(
+    df: pd.DataFrame,
+    size: Tuple[int, int] = (64, 64),
+    max_workers: int = 16,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load images into flattened grayscale float32 arrays in ``[0, 1]``.
+
+    Converts mixed ``L`` (grayscale) and ``RGB`` PNG radiographs consistently
+    to single-channel grayscale and resizes to ``size`` for fast baseline models.
+    """
+    paths = df["abs_path"].tolist()
+    labels = df["label"].values.astype(np.int64)
+
+    def _load_one(path: str) -> np.ndarray:
+        with Image.open(path) as img:
+            arr = np.asarray(img.convert("L").resize(size), dtype=np.float32)
+        return arr.ravel() / 255.0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        rows = list(ex.map(_load_one, paths))
+
+    return np.vstack(rows), labels
+
+
+# ───────────────────── TensorFlow dataset pipeline ──────────
+
+
+def make_tf_datasets(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: dict,
+) -> Tuple:
+    """Create leak-free ``tf.data.Dataset`` pipelines for Keras training & evaluation.
+
+    Compatible with both TensorFlow 2.15 (Keras 2) and TensorFlow 2.16+ (Keras 3).
+    All images (grayscale or RGB) are decoded consistently to 3-channel RGB,
+    resized to ``cfg["image"]["target_size"]``, and rescaled to ``[0, 1]``.
+    Data augmentation is applied **only** to ``train_ds``.
+    """
+    import tensorflow as tf
+
+    img_h, img_w = cfg["image"]["target_size"]
+    batch_size = cfg["training"]["batch_size"]
+    rescale_factor = float(cfg["image"].get("rescale", 1.0 / 255.0))
+    seed = int(cfg.get("seed", 42))
+    aug_cfg = cfg.get("augmentation", {})
+
+    aug_layers = None
+    if aug_cfg.get("enabled", False):
+        layers = []
+        if aug_cfg.get("horizontal_flip", True):
+            layers.append(tf.keras.layers.RandomFlip("horizontal", seed=seed))
+        rot_deg = float(aug_cfg.get("rotation_range", 20))
+        if rot_deg > 0:
+            layers.append(tf.keras.layers.RandomRotation(rot_deg / 360.0, seed=seed))
+        w_shift = float(aug_cfg.get("width_shift_range", 0.1))
+        h_shift = float(aug_cfg.get("height_shift_range", 0.1))
+        if w_shift > 0 or h_shift > 0:
+            layers.append(
+                tf.keras.layers.RandomTranslation(
+                    height_factor=h_shift, width_factor=w_shift, seed=seed
+                )
+            )
+        zoom = float(aug_cfg.get("zoom_range", 0.1))
+        if zoom > 0:
+            layers.append(tf.keras.layers.RandomZoom(zoom, seed=seed))
+        if layers:
+            aug_layers = tf.keras.Sequential(layers, name="train_augmentation")
+
+    def _decode_and_resize(path, label):
+        raw_bytes = tf.io.read_file(path)
+        img = tf.io.decode_png(raw_bytes, channels=3)
+        img = tf.image.resize(img, [img_h, img_w])
+        img = tf.cast(img, tf.float32) * rescale_factor
+        return img, tf.cast(label, tf.float32)
+
+    def _build_ds(df: pd.DataFrame, is_train: bool):
+        ds = tf.data.Dataset.from_tensor_slices(
+            (df["abs_path"].values, df["label"].values)
         )
-    return ImageDataGenerator(rescale=cfg["image"]["rescale"])
+        if is_train:
+            ds = ds.shuffle(buffer_size=min(len(df), 8192), seed=seed, reshuffle_each_iteration=True)
+        ds = ds.map(_decode_and_resize, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(batch_size)
+        if is_train and aug_layers is not None:
+            ds = ds.map(
+                lambda x, y: (aug_layers(x, training=True), y),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+        return ds.prefetch(tf.data.AUTOTUNE)
 
-
-def _get_eval_datagen(cfg: dict) -> ImageDataGenerator:
-    """Return an ImageDataGenerator for validation/test (rescale only)."""
-    return ImageDataGenerator(rescale=cfg["image"]["rescale"])
+    train_ds = _build_ds(train_df, is_train=True)
+    val_ds = _build_ds(val_df, is_train=False)
+    test_ds = _build_ds(test_df, is_train=False)
+    return train_ds, val_ds, test_ds
 
 
 def make_generators(
@@ -239,126 +414,88 @@ def make_generators(
     test_df: pd.DataFrame,
     cfg: dict,
 ) -> Tuple:
-    """Create Keras ImageDataGenerator flows from dataframes.
-
-    Returns
-    -------
-    train_gen, val_gen, test_gen : DirectoryIterator-like flow
-    """
-    img_size = tuple(cfg["image"]["target_size"])
-    batch_size = cfg["training"]["batch_size"]
-    color = cfg["image"]["color_mode"]
-
-    train_datagen = _get_train_datagen(cfg)
-    eval_datagen = _get_eval_datagen(cfg)
-
-    # flow_from_dataframe needs a string label column
-    for df in [train_df, val_df, test_df]:
-        df["label_str"] = df["label"].astype(str)
-
-    train_gen = train_datagen.flow_from_dataframe(
-        train_df,
-        x_col="abs_path",
-        y_col="label_str",
-        target_size=img_size,
-        color_mode=color,
-        class_mode="binary",
-        batch_size=batch_size,
-        shuffle=True,
-        seed=cfg.get("seed", 42),
-    )
-
-    val_gen = eval_datagen.flow_from_dataframe(
-        val_df,
-        x_col="abs_path",
-        y_col="label_str",
-        target_size=img_size,
-        color_mode=color,
-        class_mode="binary",
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    test_gen = eval_datagen.flow_from_dataframe(
-        test_df,
-        x_col="abs_path",
-        y_col="label_str",
-        target_size=img_size,
-        color_mode=color,
-        class_mode="binary",
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    return train_gen, val_gen, test_gen
-
-
-# ───────────────────── class weights ────────────────────────
-
-def compute_weights(train_df: pd.DataFrame) -> Dict[int, float]:
-    """Compute class weights from the training split to handle imbalance.
-
-    Returns
-    -------
-    dict  {0: weight_normal, 1: weight_abnormal}
-    """
-    labels = train_df["label"].values
-    classes = np.unique(labels)
-    weights = compute_class_weight("balanced", classes=classes, y=labels)
-    return dict(zip(classes.astype(int), weights))
+    """Alias for :func:`make_tf_datasets` retained for backwards compatibility."""
+    return make_tf_datasets(train_df, val_df, test_df, cfg)
 
 
 # ───────────────────── convenience entry-point ──────────────
 
-def prepare_data(
-    cfg: dict | None = None,
-    config_path: str = "configs/base.yaml",
-):
-    """Full pipeline: load config → build df → clean → split → generators.
 
-    Returns
-    -------
-    dict with keys:
-        train_gen, val_gen, test_gen,
-        train_df, val_df, test_df,
-        class_weights, cleaning_report, cfg
+def prepare_data(
+    cfg: Optional[dict] = None,
+    config_path: str = "configs/base.yaml",
+    data_root: Optional[str] = None,
+    build_tf: bool = False,
+) -> dict:
+    """Execute the full leak-free data preparation pipeline.
+
+    Parameters
+    ----------
+    cfg : dict, optional
+        Pre-loaded YAML config dict. Loaded from ``config_path`` if omitted.
+    config_path : str
+        Fallback config path when ``cfg`` is None.
+    data_root : str, optional
+        Optional dataset root override (CLI / env var).
+    build_tf : bool
+        If True, also construct ``tf.data.Dataset`` pipelines (requires TensorFlow).
     """
     if cfg is None:
         cfg = load_config(config_path)
 
-    set_global_seed(cfg.get("seed", 42))
+    set_global_seed(int(cfg.get("seed", 42)))
 
-    root = cfg["data"]["root_dir"]
+    root = resolve_data_root(cfg, data_root)
 
-    # Build dataframes from CSVs
-    df = build_dataframe(root, cfg["data"]["train_image_paths"])
+    df = build_dataframe(
+        root,
+        cfg["data"]["train_image_paths"],
+        labeled_studies_csv=cfg["data"].get("train_labels"),
+    )
 
-    # Clean
-    df, cleaning_report = clean_dataframe(df)
+    df, cleaning_report = clean_dataframe(df, check_files=True, deduplicate_content=True)
 
-    # Patient-level stratified split
     split_cfg = cfg["split"]
     train_df, val_df, test_df = patient_stratified_split(
         df,
-        val_frac=split_cfg["val_fraction"],
-        test_frac=split_cfg["test_fraction"],
-        seed=split_cfg["random_seed"],
+        val_frac=float(split_cfg["val_fraction"]),
+        test_frac=float(split_cfg["test_fraction"]),
+        seed=int(split_cfg["random_seed"]),
     )
 
-    # Class weights from training split only
     class_weights = compute_weights(train_df)
 
-    # Keras generators
-    train_gen, val_gen, test_gen = make_generators(train_df, val_df, test_df, cfg)
+    official_valid_df = None
+    valid_csv = cfg["data"].get("valid_image_paths")
+    if valid_csv and os.path.isfile(os.path.join(root, valid_csv)):
+        official_valid_df = build_dataframe(
+            root,
+            valid_csv,
+            labeled_studies_csv=cfg["data"].get("valid_labels"),
+        )
 
-    return {
-        "train_gen": train_gen,
-        "val_gen": val_gen,
-        "test_gen": test_gen,
+    result = {
         "train_df": train_df,
         "val_df": val_df,
         "test_df": test_df,
+        "official_valid_df": official_valid_df,
         "class_weights": class_weights,
         "cleaning_report": cleaning_report,
+        "data_root": root,
         "cfg": cfg,
     }
+
+    if build_tf:
+        train_ds, val_ds, test_ds = make_tf_datasets(train_df, val_df, test_df, cfg)
+        result.update(
+            {
+                "train_gen": train_ds,
+                "val_gen": val_ds,
+                "test_gen": test_ds,
+                "train_ds": train_ds,
+                "val_ds": val_ds,
+                "test_ds": test_ds,
+            }
+        )
+
+    return result

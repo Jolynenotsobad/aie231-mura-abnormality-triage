@@ -1,13 +1,18 @@
 """
-train.py — Training loop, callbacks, and logging for MURA models.
+train.py — Training entry point and experiment logger for MURA triage.
 
-Checkpoint 2 provides the baseline training/evaluation entry point.
-Full neural-network training (Checkpoint 3+) will extend this module
-with Keras model.fit(), callbacks (EarlyStopping, ModelCheckpoint),
-and TensorBoard integration.
+Checkpoint 2 implements full-split baseline evaluation (``--baseline``):
+  - ``MajorityBaseline`` (trivial floor)
+  - ``LogisticBaseline`` unweighted vs ``class_weight='balanced'``
+    (demonstrating the effect of imbalance handling on per-class recall)
 
-Usage (baselines — Checkpoint 2):
-    python -m src.train --config configs/base.yaml --baseline
+All metrics are computed strictly on the patient-grouped validation split
+(never touching the held-out test split) and logged to
+``experiments/experiment_log.csv``.
+
+Usage:
+    python -m src.train --config configs/exp_baseline.yaml --baseline
+    python -m src.train --config configs/exp_baseline.yaml --baseline --data-root /path/to/MURA-v1.1
 
 Authors: Team — Tech Lead work package.
 """
@@ -16,137 +21,204 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import time
 from datetime import datetime
+from typing import Optional
 
-import numpy as np
+from src.data import load_config, load_flattened_images, prepare_data, set_global_seed
+from src.evaluate import evaluate_study_level, print_classification_report
+from src.models import LogisticBaseline, MajorityBaseline
 
-from src.data import load_config, prepare_data, set_global_seed
-from src.models import (
-    LogisticBaseline,
-    MajorityBaseline,
-    sample_from_generator,
-)
-
-
-def run_baselines(cfg: dict) -> list[dict]:
-    """Run both baselines and return their evaluation dicts.
-
-    Steps:
-      1. Prepare data with the full pipeline (leak-free splits).
-      2. Sample images from train and val generators into numpy arrays.
-      3. Fit and evaluate MajorityBaseline and LogisticBaseline.
-      4. Log results to experiments/experiment_log.csv.
-    """
-    data = prepare_data(cfg=cfg)
-    train_gen = data["train_gen"]
-    val_gen = data["val_gen"]
-
-    print("Sampling images for sklearn baselines …")
-    X_train, y_train = sample_from_generator(train_gen, n_samples=3000)
-    X_val, y_val = sample_from_generator(val_gen, n_samples=1000)
-
-    results = []
-
-    # ── 1. Majority-class baseline ───────────────────────────
-    print("\n══ Majority-class baseline ══")
-    t0 = time.time()
-    majority = MajorityBaseline().fit(X_train, y_train)
-    metrics_maj = majority.evaluate(X_val, y_val)
-    metrics_maj["train_time_s"] = round(time.time() - t0, 2)
-    _print_metrics(metrics_maj)
-    results.append(metrics_maj)
-
-    # ── 2. Logistic regression baseline ──────────────────────
-    print("\n══ Logistic Regression baseline ══")
-    t0 = time.time()
-    logistic = LogisticBaseline().fit(X_train, y_train)
-    metrics_lr = logistic.evaluate(X_val, y_val)
-    metrics_lr["train_time_s"] = round(time.time() - t0, 2)
-    _print_metrics(metrics_lr)
-    results.append(metrics_lr)
-
-    # ── Log to CSV ───────────────────────────────────────────
-    _log_experiments(results, cfg)
-
-    return results
+LOG_PATH = "experiments/experiment_log.csv"
+LOG_FIELDS = [
+    "run_id",
+    "date",
+    "author",
+    "model",
+    "hyperparameters",
+    "seed",
+    "train_time_s",
+    "parameters",
+    "train_accuracy",
+    "train_kappa",
+    "val_accuracy",
+    "val_normal_recall",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_macro_f1",
+    "val_kappa",
+    "val_auc",
+    "notes",
+]
 
 
-def _print_metrics(m: dict) -> None:
-    """Pretty-print a metrics dict."""
-    print(f"  Model     : {m['model']}")
-    print(f"  Accuracy  : {m['accuracy']:.4f}")
-    print(f"  Precision : {m['precision']:.4f}")
-    print(f"  Recall    : {m['recall']:.4f}")
-    print(f"  F1        : {m['f1']:.4f}")
-    print(f"  Macro-F1  : {m['macro_f1']:.4f}")
-    print(f"  Cohen κ   : {m['kappa']:.4f}")
-    if "train_time_s" in m:
-        print(f"  Train time: {m['train_time_s']}s")
+def run_baselines(cfg: dict, data_root: Optional[str] = None) -> list[dict]:
+    """Run all Checkpoint 2 baselines on the full patient-grouped validation split."""
+    data = prepare_data(cfg=cfg, data_root=data_root, build_tf=False)
+    train_df = data["train_df"]
+    val_df = data["val_df"]
+    test_df = data["test_df"]
+    seed = int(cfg.get("seed", 42))
 
+    print("Data preparation summary:")
+    print(f"  Data root        : {data['data_root']}")
+    print(f"  Cleaning report  : {data['cleaning_report']}")
+    print(
+        f"  Split images     : train={len(train_df):,}, val={len(val_df):,}, test={len(test_df):,} (held out)"
+    )
+    print(f"  Train class wts  : { {k: round(v, 4) for k, v in data['class_weights'].items()} }")
 
-def _log_experiments(results: list[dict], cfg: dict) -> None:
-    """Append experiment results to experiments/experiment_log.csv."""
-    log_path = "experiments/experiment_log.csv"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    print("\nLoading 64x64 grayscale pixels for full train & validation splits ...")
+    t_load = time.time()
+    X_train, y_train = load_flattened_images(train_df, size=(64, 64))
+    X_val, y_val = load_flattened_images(val_df, size=(64, 64))
+    print(f"  Loaded X_train {X_train.shape}, X_val {X_val.shape} in {time.time() - t_load:.2f}s")
 
-    fieldnames = [
-        "run_id", "date", "author", "model", "seed",
-        "accuracy", "precision", "recall", "f1", "macro_f1", "kappa",
-        "train_time_s", "notes",
+    runs = [
+        (
+            "baseline_majority",
+            MajorityBaseline(),
+            {"strategy": "most_frequent"},
+            0,
+            "Trivial majority-class floor (Checkpoint 2)",
+        ),
+        (
+            "baseline_logreg_unweighted",
+            LogisticBaseline(C=0.01, max_iter=1000, class_weight=None, seed=seed),
+            {"input": "64x64_gray", "scaler": "StandardScaler", "C": 0.01, "class_weight": None},
+            X_train.shape[1] + 1,
+            "Learned linear baseline without imbalance handling (Checkpoint 2)",
+        ),
+        (
+            "baseline_logreg_balanced",
+            LogisticBaseline(C=0.01, max_iter=1000, class_weight="balanced", seed=seed),
+            {"input": "64x64_gray", "scaler": "StandardScaler", "C": 0.01, "class_weight": "balanced"},
+            X_train.shape[1] + 1,
+            "Learned linear baseline with balanced class weights (Checkpoint 2)",
+        ),
     ]
 
-    file_exists = os.path.isfile(log_path)
-    with open(log_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
+    logged_rows: list[dict] = []
+    for run_id, model, hparams, n_params, notes in runs:
+        print(f"\n══ {model.name} ({run_id}) ══")
+        t0 = time.time()
+        model.fit(X_train, y_train)
+        train_time = round(time.time() - t0, 2)
 
-        for i, m in enumerate(results, start=1):
-            writer.writerow({
-                "run_id": f"baseline_{i}",
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "author": "team",
-                "model": m["model"],
-                "seed": cfg.get("seed", 42),
-                "accuracy": round(m["accuracy"], 4),
-                "precision": round(m["precision"], 4),
-                "recall": round(m["recall"], 4),
-                "f1": round(m["f1"], 4),
-                "macro_f1": round(m["macro_f1"], 4),
-                "kappa": round(m["kappa"], 4),
-                "train_time_s": m.get("train_time_s", ""),
-                "notes": "Checkpoint 2 baseline",
-            })
+        train_metrics = model.evaluate(X_train, y_train)
+        val_metrics = model.evaluate(X_val, y_val)
+        val_probs = model.predict_proba(X_val)[:, 1]
+        val_preds = model.predict(X_val)
+        study_metrics = evaluate_study_level(val_df, val_probs)
 
-    print(f"\n✓ Results appended to {log_path}")
+        _print_metrics(val_metrics, train_time=train_time, study_metrics=study_metrics)
+        print_classification_report(y_val, val_preds)
+
+        row = {
+            "run_id": run_id,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "author": "team",
+            "model": model.name,
+            "hyperparameters": json.dumps(hparams),
+            "seed": seed,
+            "train_time_s": train_time,
+            "parameters": n_params,
+            "train_accuracy": round(train_metrics["accuracy"], 4),
+            "train_kappa": round(train_metrics["kappa"], 4),
+            "val_accuracy": round(val_metrics["accuracy"], 4),
+            "val_normal_recall": round(val_metrics["normal_recall"], 4),
+            "val_precision": round(val_metrics["precision"], 4),
+            "val_recall": round(val_metrics["recall"], 4),
+            "val_f1": round(val_metrics["f1"], 4),
+            "val_macro_f1": round(val_metrics["macro_f1"], 4),
+            "val_kappa": round(val_metrics["kappa"], 4),
+            "val_auc": round(val_metrics.get("auc", 0.5), 4),
+            "notes": notes,
+        }
+        logged_rows.append(row)
+
+    _upsert_experiment_log(logged_rows)
+    return logged_rows
 
 
-# ────────────────────────────────────────────────────────────
-#  CLI entry point
-# ────────────────────────────────────────────────────────────
+def _print_metrics(
+    m: dict,
+    train_time: float,
+    study_metrics: Optional[dict] = None,
+) -> None:
+    """Pretty-print image-level and optional study-level triage metrics."""
+    print(f"  Accuracy        : {m['accuracy']:.4f}")
+    print(f"  Normal Recall   : {m['normal_recall']:.4f}")
+    print(f"  Abnormal Recall : {m['recall']:.4f}")
+    print(f"  Precision       : {m['precision']:.4f}")
+    print(f"  F1 (Abnormal)   : {m['f1']:.4f}")
+    print(f"  Macro-F1        : {m['macro_f1']:.4f}")
+    print(f"  Cohen kappa (k) : {m['kappa']:.4f}")
+    print(f"  ROC-AUC         : {m.get('auc', 0.5):.4f}")
+    print(f"  Train time      : {train_time:.2f}s")
+    if study_metrics is not None:
+        print(
+            f"  [Study-level]   : Acc={study_metrics['accuracy']:.4f}, "
+            f"Rec={study_metrics['recall']:.4f}, "
+            f"MacroF1={study_metrics['macro_f1']:.4f}, "
+            f"Kappa={study_metrics['kappa']:.4f}, "
+            f"AUC={study_metrics.get('auc', 0.5):.4f}"
+        )
 
-def main():
-    parser = argparse.ArgumentParser(description="Train MURA models")
+
+def _upsert_experiment_log(rows: list[dict], log_path: str = LOG_PATH) -> None:
+    """Write or update experiment rows in ``experiments/experiment_log.csv``."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    existing: list[dict] = []
+    if os.path.isfile(log_path):
+        with open(log_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames == LOG_FIELDS:
+                incoming_ids = {r["run_id"] for r in rows}
+                existing = [r for r in reader if r.get("run_id") not in incoming_ids]
+
+    all_rows = existing + rows
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"\n[OK] Logged {len(rows)} baseline runs to {log_path}")
+
+
+def main() -> None:
+    """CLI entry point for baseline and neural network training."""
+    parser = argparse.ArgumentParser(description="Train MURA triage models")
     parser.add_argument(
-        "--config", type=str, default="configs/base.yaml",
+        "--config",
+        type=str,
+        default="configs/base.yaml",
         help="Path to YAML config file",
     )
     parser.add_argument(
-        "--baseline", action="store_true",
+        "--baseline",
+        action="store_true",
         help="Run baseline models only (Checkpoint 2)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help="Optional override path to MURA-v1.1 directory (or set MURA_DATA_DIR)",
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    set_global_seed(cfg.get("seed", 42))
+    set_global_seed(int(cfg.get("seed", 42)))
 
     if args.baseline:
-        run_baselines(cfg)
+        run_baselines(cfg, data_root=args.data_root)
     else:
-        print("Neural network training will be implemented in Checkpoint 3.")
-        print("Use --baseline to run baseline evaluation.")
+        print("Neural network training (Models A-C) will be implemented in Checkpoint 3.")
+        print("Use --baseline to run Checkpoint 2 baseline evaluation.")
 
 
 if __name__ == "__main__":

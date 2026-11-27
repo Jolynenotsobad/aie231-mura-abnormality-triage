@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -23,16 +24,13 @@ env/
 
 # Data — raw images must NOT be committed
 data/MURA-v1.1/
+data/*.zip
 
 # Saved models (large binary files)
 models/*.h5
 models/*.keras
 models/*.pkl
 models/saved_model/
-
-# Experiment outputs
-experiments/curves/
-experiments/*.png
 
 # OS
 .DS_Store

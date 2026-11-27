@@ -1,4 +1,4 @@
-name: CI — Lint and Import Check
+name: CI — Lint, Import & Unit Tests
 on:
   push:
     branches: [main]
@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 jobs:
-  lint:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check imports
+      - name: Check module imports
         run: |
-          python -c "from src.data import load_config, prepare_data"
+          python -c "from src.data import load_config, prepare_data, patient_stratified_split"
           python -c "from src.models import MajorityBaseline, LogisticBaseline"
-          python -c "from src.evaluate import compute_metrics"
+          python -c "from src.evaluate import compute_metrics, evaluate_study_level"
+          python -c "from src.train import run_baselines"
           echo "All imports OK"
+
+      - name: Run unit tests
+        run: |
+          pytest -v tests/
