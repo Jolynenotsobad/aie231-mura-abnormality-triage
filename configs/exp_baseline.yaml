@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────
+# exp_baseline.yaml — Baseline evaluation (Checkpoint 2)
+# ──────────────────────────────────────────────────────────────
+# Inherits all defaults from base.yaml.
+# Run:  python -m src.train --config configs/exp_baseline.yaml --baseline
+
+data:
+  root_dir: "data/MURA-v1.1"
+  train_labels: "train_labeled_studies.csv"
+  valid_labels: "valid_labeled_studies.csv"
+  train_image_paths: "train_image_paths.csv"
+  valid_image_paths: "valid_image_paths.csv"
+
+image:
+  target_size: [224, 224]
+  color_mode: "rgb"
+  rescale: 0.00392156862745098
+
+split:
+  val_fraction: 0.15
+  test_fraction: 0.15
+  random_seed: 42
+  stratify: true
+  group_by_patient: true
+
+imbalance:
+  use_class_weights: true
+
+augmentation:
+  enabled: false          # baselines use raw images, no augmentation
+
+training:
+  batch_size: 32
+  epochs: 1               # not used for sklearn baselines
+  optimizer: "adam"
+  learning_rate: 0.001
+  early_stopping:
+    monitor: "val_loss"
+    patience: 5
+    restore_best_weights: true
+
+seed: 42

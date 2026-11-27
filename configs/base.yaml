@@ -1,0 +1,53 @@
+# ──────────────────────────────────────────────────────────────
+# base.yaml — default configuration shared by all experiments
+# ──────────────────────────────────────────────────────────────
+
+# ── Paths ────────────────────────────────────────────────────
+data:
+  root_dir: "data/MURA-v1.1"             # root of the extracted dataset
+  train_labels: "train_labeled_studies.csv"
+  valid_labels: "valid_labeled_studies.csv"
+  train_image_paths: "train_image_paths.csv"
+  valid_image_paths: "valid_image_paths.csv"
+
+# ── Image preprocessing ─────────────────────────────────────
+image:
+  target_size: [224, 224]                 # resize all images to this (H, W)
+  color_mode: "rgb"                       # "rgb" for pretrained backbones
+  rescale: 0.00392156862745098            # 1/255
+
+# ── Splitting ────────────────────────────────────────────────
+split:
+  val_fraction: 0.15                      # fraction of train studies used for validation
+  test_fraction: 0.15                     # fraction of train studies used for test
+  random_seed: 42
+  stratify: true                          # stratify by label
+  group_by_patient: true                  # keep all studies of the same patient in one split
+
+# ── Class imbalance ──────────────────────────────────────────
+imbalance:
+  use_class_weights: true                 # pass class weights to model.fit()
+
+# ── Augmentation (training only) ─────────────────────────────
+augmentation:
+  enabled: true
+  rotation_range: 20
+  horizontal_flip: true
+  width_shift_range: 0.1
+  height_shift_range: 0.1
+  zoom_range: 0.1
+  fill_mode: "nearest"
+
+# ── Training defaults ────────────────────────────────────────
+training:
+  batch_size: 32
+  epochs: 30
+  optimizer: "adam"
+  learning_rate: 0.001
+  early_stopping:
+    monitor: "val_loss"
+    patience: 5
+    restore_best_weights: true
+
+# ── Reproducibility ──────────────────────────────────────────
+seed: 42

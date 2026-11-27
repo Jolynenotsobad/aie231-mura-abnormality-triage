@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data — raw images must NOT be committed
+data/MURA-v1.1/
+data/*.zip
+
+# Saved models (large binary files)
+models/*.h5
+models/*.keras
+models/*.pkl
+models/saved_model/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TensorBoard
+logs/
+
+# R
+.Rhistory
